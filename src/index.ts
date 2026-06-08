@@ -109,6 +109,16 @@ const dirFull = (dir: string): string =>
     .replace(/^-+|-+$/g, "")
 const dirName = (dir: string): string => dirFull(dir).slice(0, MAX_LEN)
 
+const explicitSessionID = (argv = process.argv): string => {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (arg === "-s" || arg === "--session") return argv[i + 1] || ""
+    const m = arg.match(/^--session=(.+)$/)
+    if (m) return m[1]
+  }
+  return ""
+}
+
 
 // ---------------------------------------------------------------------------
 // Persistent tmux setup (idempotent managed block in ~/.tmux.conf)
@@ -391,16 +401,15 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   await clearStyle()
 
   if (llmMode) {
-    // Startup probe: name a resumed/idle session that emits no events on its own.
+    const resumedSessionID = explicitSessionID()
+    // Startup probe: name an explicitly resumed/idle session that emits no
+    // events on its own. A plain blank session must not inherit the latest
+    // historical session name from the same directory.
     // nameSession applies the priority (title -> prompt -> dir fallback for old).
     const startupProbe = async () => {
-      if (contentSession) return
+      if (contentSession || !resumedSessionID) return
       try {
-        const list = await client.session.list()
-        const cands = ((list?.data ?? []) as any[])
-          .filter((s) => !s.parentID && (s.directory === directory || s.directory === worktree))
-          .sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0))
-        if (cands[0]) await nameSession(cands[0].id)
+        await nameSession(resumedSessionID)
       } catch (e) {
         dbg("startup probe error", String(e).slice(0, 160))
       }
