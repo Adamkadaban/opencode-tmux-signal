@@ -1,0 +1,57 @@
+{
+  "name": "opencode-tmux-signal",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that signals agent state in tmux — recolors the window when it needs input or finishes, and names the window after the project directory",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tmux",
+    "notification",
+    "status",
+    "window",
+    "agent",
+    "signal"
+  ],
+  "author": "Adam Hassan",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Adamkadaban/opencode-tmux-signal.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Adamkadaban/opencode-tmux-signal/issues"
+  },
+  "homepage": "https://github.com/Adamkadaban/opencode-tmux-signal#readme",
+  "engines": {
+    "opencode": ">=1.14.22"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.0 <2.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.15.3",
+    "@types/bun": "^1.3.1",
+    "typescript": "^5.9.3"
+  }
+}
