@@ -31,7 +31,7 @@ const config = {
   question: { bg: env("QUESTION_BG", "colour97"), fg: env("QUESTION_FG", "white") } as Style,
   // Soft red: the main agent finished (or errored) while you were away.
   done: { bg: env("DONE_BG", "colour131"), fg: env("DONE_FG", "white") } as Style,
-  // "llm" -> short LLM-generated slug from your first prompt;
+  // "llm" -> short LLM-generated slug from your first prompt / session title;
   // "dir" -> project directory basename; "off" -> leave the window name alone.
   windowName: env("WINDOW_NAME", "llm"),
   // Cheap/small models tried in order (fallbacks) for the naming call.
@@ -102,12 +102,12 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   }
 
   // Sub-agent (child) sessions have a parentID. Track them so their lifecycle
-  // events don't flash the main window.
+  // events don't flash the main window (and so the throwaway naming session is
+  // ignored too).
   const childSessions = new Set<string>()
 
-  // Ask a cheap model for a short window-name slug from the first prompt, using
-  // a throwaway session that is ignored by the visual state machine and deleted
-  // immediately after.
+  // Ask a cheap model for a short window-name slug, using a throwaway session
+  // that is ignored by the visual state machine and deleted immediately after.
   const llmSlug = async (text: string, fallbackModel?: ModelRef): Promise<string> => {
     const models = config.nameModels.slice()
     if (fallbackModel?.providerID && fallbackModel?.modelID) models.push(fallbackModel)
@@ -150,6 +150,38 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     }
   }
 
+  // Naming runs at most once. `named` is claimed synchronously so concurrent
+  // triggers (first prompt vs. resumed-session title) can't both fire.
+  let named = config.windowName !== "llm"
+  let probed = false // one-time fetch fallback for resumed sessions
+
+  const startNaming = (text: string | undefined, fallbackModel?: ModelRef): void => {
+    const t = (text || "").trim()
+    if (named || !t) return
+    named = true
+    void (async () => {
+      try {
+        const slug = await llmSlug(t, fallbackModel)
+        await renameIfDefault(slug)
+      } catch {
+        /* non-fatal */
+      }
+    })()
+  }
+
+  // Resumed/pre-existing session: opencode already has an LLM-generated title.
+  // Use it (from the event payload when present, else a one-time fetch).
+  const probeResume = async (sessionID?: string): Promise<void> => {
+    if (named || probed || !sessionID || childSessions.has(sessionID)) return
+    probed = true
+    try {
+      const s = await client.session.get({ path: { id: sessionID } })
+      startNaming(s?.data?.title)
+    } catch {
+      /* non-fatal */
+    }
+  }
+
   // --- one-time setup ------------------------------------------------------
 
   if (config.windowName === "dir") {
@@ -171,8 +203,6 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
 
   let lastState: State = "off"
   let idleAt = 0
-  // Naming runs at most once (first user prompt). Disabled unless in llm mode.
-  let named = config.windowName !== "llm"
 
   const setState = async (state: State): Promise<void> => {
     if (state === lastState) return
@@ -187,22 +217,25 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     event: async ({ event }) => {
       const props = (event as { properties?: Record<string, any> }).properties
 
-      if (
-        (event.type === "session.created" || event.type === "session.updated") &&
-        props?.info?.parentID
-      ) {
-        childSessions.add(props.info.id)
-        return
+      if (event.type === "session.created" || event.type === "session.updated") {
+        if (props?.info?.parentID) {
+          childSessions.add(props.info.id)
+          return
+        }
+        // Root session with an existing title -> resumed-session naming.
+        if (!named && props?.info?.title) startNaming(props.info.title)
       }
 
       if (event.type === "session.status" && props?.status?.type === "busy") {
         if (childSessions.has(props.sessionID)) return
+        if (!named) void probeResume(props.sessionID) // resume fallback
         if (Date.now() - idleAt < 2000) return // race guard vs. a just-fired idle
         await setState("running")
       }
 
       if (event.type === "session.idle") {
         if (childSessions.has(props?.sessionID)) return
+        if (!named) void probeResume(props?.sessionID) // resume fallback
         idleAt = Date.now()
         await setState("done")
       }
@@ -214,26 +247,16 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       }
     },
 
-    // First user prompt -> generate a short window name (fire-and-forget so we
-    // never delay the user's message).
+    // First user prompt of a new session -> generate a short window name
+    // (fire-and-forget so we never delay the user's message).
     "chat.message": async (input, output) => {
       if (named) return
       if (childSessions.has(input.sessionID)) return
-      named = true
       const text = ((output?.parts ?? []) as any[])
         .filter((p) => p.type === "text")
         .map((p) => p.text as string)
         .join(" ")
-        .trim()
-      if (!text) return
-      void (async () => {
-        try {
-          const slug = await llmSlug(text, input.model)
-          await renameIfDefault(slug)
-        } catch {
-          /* non-fatal */
-        }
-      })()
+      startNaming(text, input.model)
     },
 
     // The agent is blocked asking permission.
