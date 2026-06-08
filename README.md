@@ -4,11 +4,12 @@
 [![npm downloads](https://img.shields.io/npm/dm/opencode-tmux-signal.svg)](https://www.npmjs.com/package/opencode-tmux-signal)
 [![license](https://img.shields.io/npm/l/opencode-tmux-signal.svg)](./LICENSE)
 
-OpenCode plugin that signals agent state in tmux — recolors **this pane's window** when it needs your input or finishes, and names the window after the project directory so the window list shows *what* it is instead of just `opencode`.
+OpenCode plugin that signals agent state in tmux — recolors **this pane's window** when it needs your attention or finishes, and names the window after the project directory so the window list shows *what* it is instead of just `opencode`.
 
 ## What it does
 
-- **Needs input → purple** — the agent is blocked on a permission prompt or a question
+- **Permission request → yellow** — the agent is asking to do something and is waiting on you
+- **Question → purple** — the agent asked you a question (the `question` tool)
 - **Done → soft red** — the main agent finished (or errored) while you were away
 - **Working / focused → normal** — no highlight while you're looking at it
 - **Window naming** — renames the window to the project directory (`~/code/foo` → `foo`)
@@ -42,8 +43,10 @@ All options are environment variables (set them in your shell profile). Defaults
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `OPENCODE_TMUX_SIGNAL_NEEDS_INPUT_BG` | `colour97` | Needs-input background (mellow purple) |
-| `OPENCODE_TMUX_SIGNAL_NEEDS_INPUT_FG` | `white` | Needs-input text |
+| `OPENCODE_TMUX_SIGNAL_PERMISSION_BG` | `colour179` | Permission-request background (mellow yellow) |
+| `OPENCODE_TMUX_SIGNAL_PERMISSION_FG` | `black` | Permission-request text |
+| `OPENCODE_TMUX_SIGNAL_QUESTION_BG` | `colour97` | Question background (mellow purple) |
+| `OPENCODE_TMUX_SIGNAL_QUESTION_FG` | `white` | Question text |
 | `OPENCODE_TMUX_SIGNAL_DONE_BG` | `colour131` | Done background (soft red) |
 | `OPENCODE_TMUX_SIGNAL_DONE_FG` | `white` | Done text |
 | `OPENCODE_TMUX_SIGNAL_WINDOW_NAME` | `dir` | `dir` = rename window to project dir; `off` = leave it |
@@ -54,17 +57,18 @@ Colors accept any tmux color: `red`, `brightblue`, or `colour0`–`colour255`.
 ```sh
 # example overrides
 export OPENCODE_TMUX_SIGNAL_DONE_BG=colour52
-export OPENCODE_TMUX_SIGNAL_NEEDS_INPUT_BG=colour60
+export OPENCODE_TMUX_SIGNAL_QUESTION_BG=colour60
 export OPENCODE_TMUX_SIGNAL_WINDOW_NAME=off
 ```
 
 ## How it works
 
-The plugin maps OpenCode events to three states and styles only its own window:
+The plugin maps OpenCode events to states and styles only its own window:
 
 | Trigger | State | Visual |
 | --- | --- | --- |
-| `permission.ask` hook, `question` tool | needs-input | purple `window-status-style` |
+| `permission.ask` hook | permission | yellow `window-status-style` |
+| `question` tool | question | purple `window-status-style` |
 | `session.idle`, `session.error` (main session) | done | soft-red `window-status-style` |
 | `session.status` busy (main session) | running | cleared |
 

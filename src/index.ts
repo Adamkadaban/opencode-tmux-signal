@@ -13,8 +13,10 @@ const env = (key: string, fallback: string): string => process.env[PREFIX + key]
 type Style = { bg: string; fg: string }
 
 const config = {
-  // Purple: the agent is blocked waiting on you (permission prompt / question).
-  needsInput: { bg: env("NEEDS_INPUT_BG", "colour97"), fg: env("NEEDS_INPUT_FG", "white") } as Style,
+  // Yellow: the agent is asking permission to do something.
+  permission: { bg: env("PERMISSION_BG", "colour179"), fg: env("PERMISSION_FG", "black") } as Style,
+  // Purple: the agent is asking you a question.
+  question: { bg: env("QUESTION_BG", "colour97"), fg: env("QUESTION_FG", "white") } as Style,
   // Soft red: the main agent finished (or errored) while you were away.
   done: { bg: env("DONE_BG", "colour131"), fg: env("DONE_FG", "white") } as Style,
   // "dir" -> rename the window to the project directory; "off" -> leave it.
@@ -23,7 +25,7 @@ const config = {
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
 }
 
-type State = "running" | "needs-input" | "done" | "off"
+type State = "running" | "permission" | "question" | "done" | "off"
 
 // ---------------------------------------------------------------------------
 // Plugin
@@ -97,7 +99,8 @@ export const TmuxSignal: Plugin = async ({ $, directory, worktree }) => {
   const setState = async (state: State): Promise<void> => {
     if (state === lastState) return
     lastState = state
-    if (state === "needs-input") await applyStyle(config.needsInput)
+    if (state === "permission") await applyStyle(config.permission)
+    else if (state === "question") await applyStyle(config.question)
     else if (state === "done") await applyStyle(config.done)
     else await clearStyle() // running / off -> no highlight
   }
@@ -134,12 +137,13 @@ export const TmuxSignal: Plugin = async ({ $, directory, worktree }) => {
       }
     },
 
-    // Genuine "waiting on you" signals.
+    // The agent is blocked asking permission.
     "permission.ask": async () => {
-      await setState("needs-input")
+      await setState("permission")
     },
+    // The question tool blocks waiting for your answer.
     "tool.execute.before": async (input: { tool: string }) => {
-      if (input.tool === "question") await setState("needs-input")
+      if (input.tool === "question") await setState("question")
     },
   }
 }
