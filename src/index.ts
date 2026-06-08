@@ -37,18 +37,25 @@ const config = {
   question: { bg: env("QUESTION_BG", "colour97"), fg: env("QUESTION_FG", "white") } as Style,
   done: { bg: env("DONE_BG", "colour131"), fg: env("DONE_FG", "white") } as Style,
   windowName: env("WINDOW_NAME", "llm"),
-  nameModels: parseModels(
-    env(
-      "NAME_MODELS",
-      "github-copilot/gpt-5.4-mini,github-copilot/claude-haiku-4.5,github-copilot/gemini-3.5-flash",
-    ),
-  ),
+  // Optional explicit override (comma-separated provider/model). When empty,
+  // model selection prefers opencode's small_model, then a built-in fast list,
+  // then the session's own model.
+  nameModels: parseModels(env("NAME_MODELS", "")),
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
   manageTmuxConf: env("MANAGE_TMUX_CONF", "on") !== "off",
 }
 
 // Maximum tmux window-name length.
 const MAX_LEN = 8
+
+// Fast, cheap models tried when no small_model is configured. A model the user
+// can't access simply errors and the next is tried; for non-listed providers,
+// the configured small_model and the session's own model cover it.
+const BUILTIN_MODELS: ModelRef[] = [
+  { providerID: "github-copilot", modelID: "gpt-5-mini" },
+  { providerID: "github-copilot", modelID: "claude-haiku-4.5" },
+  { providerID: "github-copilot", modelID: "gemini-3.5-flash" },
+]
 
 const DEFAULT_WINDOW_NAME = "opencode"
 const THROWAWAY_TITLE = "opencode-tmux-signal: window name"
@@ -77,7 +84,7 @@ const slugify = (raw: string): string => {
   const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
   const filler = new Set(["name", "the", "a", "an", "is", "for", "project", "task", "window"])
   const pick = toks.find((t) => !filler.has(t)) || toks[0] || ""
-  return pick.replace(/^-+|-+$/g, "").slice(0, MAX_LEN)
+  return pick.replace(/^-+|-+$/g, "").slice(0, 40)
 }
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
@@ -199,38 +206,75 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     dbg("renamed window ->", name)
   }
 
-  // Ask a cheap model for a short window-name slug, using a throwaway session
-  // that is ignored by the visual state machine and deleted immediately after.
-  const llmSlug = async (text: string, fallbackModel?: ModelRef): Promise<string> => {
-    const models = config.nameModels.slice()
-    if (fallbackModel?.providerID && fallbackModel?.modelID) models.push(fallbackModel)
-    if (models.length === 0) return ""
+  const dedupeAdd = (arr: ModelRef[], m?: ModelRef | null): void => {
+    if (m?.providerID && m?.modelID && !arr.some((x) => x.providerID === m.providerID && x.modelID === m.modelID)) arr.push(m)
+  }
+  const parseModel = (s?: string): ModelRef | null => {
+    const i = (s || "").indexOf("/")
+    return i > 0 ? { providerID: (s as string).slice(0, i), modelID: (s as string).slice(i + 1) } : null
+  }
+  // Resolve naming models, preferring a subscription-appropriate small model:
+  // explicit override -> opencode's configured small_model -> built-in fast list
+  // -> the session's own model (always usable with the active subscription).
+  const resolveModels = async (sessionModel?: ModelRef): Promise<ModelRef[]> => {
+    const out: ModelRef[] = []
+    if (config.nameModels.length) {
+      config.nameModels.forEach((m) => dedupeAdd(out, m))
+    } else {
+      try {
+        const c = await client.config.get()
+        dedupeAdd(out, parseModel((c?.data as any)?.small_model))
+      } catch {
+        /* ignore */
+      }
+      BUILTIN_MODELS.forEach((m) => dedupeAdd(out, m))
+    }
+    dedupeAdd(out, sessionModel)
+    return out
+  }
+
+  const textParts = (res: any): string =>
+    ((res?.data?.parts ?? []) as any[]).filter((p) => p.type === "text").map((p) => p.text as string).join(" ")
+
+  // Ask a model for a window-name slug. The model is told to keep it <= MAX_LEN;
+  // if it returns something longer we reject it and ask again (trying the next
+  // model / a stronger instruction) rather than blindly truncating.
+  const llmSlug = async (text: string, sessionModel?: ModelRef): Promise<string> => {
+    const models = await resolveModels(sessionModel)
+    if (!models.length) return ""
     let tmpId: string | undefined
     try {
       const created = await client.session.create({ body: { title: THROWAWAY_TITLE } })
       tmpId = created?.data?.id
       if (!tmpId) return ""
       childSessions.add(tmpId)
-      const system =
-        "You name a tmux window for a coding session. Reply with ONLY one short lowercase token " +
-        `(a word, abbreviation, or acronym), max ${MAX_LEN} characters, using only a-z, 0-9 and hyphens. ` +
+      const base =
+        "You name a tmux window for a coding session. Reply with ONLY one lowercase token " +
+        `(a word, abbreviation, or acronym), ${MAX_LEN} characters or fewer, using only a-z, 0-9 and hyphens. ` +
         "No spaces, quotes, punctuation, or explanation."
-      const parts = [{ type: "text" as const, text: `Task: ${text.slice(0, 400)}` }]
-      for (const model of models) {
+      const userText = `Task: ${text.slice(0, 400)}`
+      let best = ""
+      const maxAttempts = Math.min(5, models.length + 2)
+      for (let i = 0; i < maxAttempts; i++) {
+        const model = models[Math.min(i, models.length - 1)]
+        const system =
+          i === 0 ? base : `${base} Your previous answer was too long — it MUST be ${MAX_LEN} characters or fewer; abbreviate or use an acronym.`
         try {
-          const res = await client.session.prompt({ path: { id: tmpId }, body: { model, system, parts } })
-          const out = ((res?.data?.parts ?? []) as any[])
-            .filter((p) => p.type === "text")
-            .map((p) => p.text as string)
-            .join(" ")
-          dbg("llmSlug raw", `${model.providerID}/${model.modelID}`, JSON.stringify(out))
-          const slug = slugify(out)
-          if (slug && !BAD_SLUGS.has(slug)) return slug
+          const res = await client.session.prompt({
+            path: { id: tmpId },
+            body: { model, system, parts: [{ type: "text" as const, text: userText }] },
+          })
+          const slug = slugify(textParts(res))
+          dbg("llmSlug", `${model.providerID}/${model.modelID}`, "->", JSON.stringify(slug), `(len ${slug.length})`)
+          if (slug && !BAD_SLUGS.has(slug)) {
+            if (slug.length <= MAX_LEN) return slug
+            if (!best) best = slug // remember in case nothing fits, as a last resort
+          }
         } catch (e) {
-          dbg("llmSlug model failed", String(e).slice(0, 120))
+          dbg("llmSlug model failed", `${model.providerID}/${model.modelID}`, String(e).slice(0, 120))
         }
       }
-      return ""
+      return best ? best.slice(0, MAX_LEN) : ""
     } catch (e) {
       dbg("llmSlug error", String(e).slice(0, 160))
       return ""
@@ -342,12 +386,18 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   let lastState: State = "off"
   let idleAt = 0
 
+  // True when this window is the one you're currently looking at.
+  const isWindowActive = async (): Promise<boolean> =>
+    (await tmuxOut("display-message", "-p", "-t", windowId, "#{window_active}")) === "1"
+
   const setState = async (state: State): Promise<void> => {
     if (state === lastState) return
     lastState = state
-    if (state === "permission") await applyStyle(config.permission)
-    else if (state === "question") await applyStyle(config.question)
-    else if (state === "done") await applyStyle(config.done)
+    const style =
+      state === "permission" ? config.permission : state === "question" ? config.question : state === "done" ? config.done : null
+    // Only highlight when the window is in the background — if you're already on
+    // it, you've seen the state change, so leave it unhighlighted.
+    if (style && !(await isWindowActive())) await applyStyle(style)
     else await clearStyle()
   }
 

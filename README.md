@@ -58,7 +58,7 @@ Everything is optional and set via environment variables. Defaults are a mellow 
 | `OPENCODE_TMUX_SIGNAL_QUESTION_BG` / `_FG` | `colour97` / `white` | Question colors (purple) |
 | `OPENCODE_TMUX_SIGNAL_DONE_BG` / `_FG` | `colour131` / `white` | Done/error colors (soft red) |
 | `OPENCODE_TMUX_SIGNAL_WINDOW_NAME` | `llm` | `llm` (slug), `dir` (project directory), or `off` |
-| `OPENCODE_TMUX_SIGNAL_NAME_MODELS` | `github-copilot/gpt-5.4-mini, …claude-haiku-4.5, …gemini-3.5-flash` | `provider/model` list tried in order |
+| `OPENCODE_TMUX_SIGNAL_NAME_MODELS` | _(auto)_ | Optional `provider/model` override list. When unset, uses opencode's `small_model`, then a built-in fast list, then the session's model |
 | `OPENCODE_TMUX_SIGNAL_RESET_ON_FOCUS` | `on` | Clear the highlight when you open the window |
 | `OPENCODE_TMUX_SIGNAL_MANAGE_TMUX_CONF` | `on` | Manage the `~/.tmux.conf` block |
 | `OPENCODE_TMUX_SIGNAL_DEBUG` | _(unset)_ | Log decisions to `/tmp/opencode-tmux-signal.log` |
@@ -68,8 +68,10 @@ Colors accept any tmux color: `red`, `brightblue`, or `colour0`–`colour255`.
 ## How it works
 
 - The window is resolved once from `$TMUX_PANE`, so multi-pane layouts target the right window.
-- State is colored with `window-status-style`, which only shows on **inactive** windows; a `pane-focus-in` / `after-select` hook clears it when you open the window.
-- Naming starts from the project directory, then upgrades to a short model slug once there's a real prompt or title. The model call runs in a throwaway session (deleted right after), and it only renames a window whose name is still a bare process name (`opencode`, `nano`, …) — never a custom one.
+- State is colored with `window-status-style`. It's only applied when the window is in the background — if you're already on the window when the state changes, it stays unhighlighted — and a `pane-focus-in` / `after-select` hook clears it when you return to a highlighted window.
+- Names are produced by a model that's told to keep them ≤ 8 characters; if a reply is longer it's rejected and the model is asked again (escalating instruction, next model) rather than blindly truncated.
+- Model selection prefers opencode's configured `small_model` (so it uses whatever's right for your subscription — Copilot, Codex, Claude, …), then a built-in fast list, then the session's own model. The call runs in a throwaway session, deleted right after.
+- It only renames a window whose name is still a bare process name (`opencode`, `nano`, …) or one it set itself — never a custom name.
 - Sub-agent sessions (those with a `parentID`) are tracked and ignored, so a finishing sub-agent never flashes the main window.
 
 ## Development
