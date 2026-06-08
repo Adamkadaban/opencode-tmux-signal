@@ -21,7 +21,7 @@ const config = {
   done: { bg: env("DONE_BG", "colour131"), fg: env("DONE_FG", "white") } as Style,
   // "dir" -> rename the window to the project directory; "off" -> leave it.
   windowName: env("WINDOW_NAME", "dir"),
-  // Clear the highlight once you focus the window ("mark as read").
+  // Clear the highlight once you select the window ("mark as read").
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
 }
 
@@ -73,17 +73,13 @@ export const TmuxSignal: Plugin = async ({ $, directory, worktree }) => {
     await tmux("rename-window", "-t", windowId, name)
   }
 
-  // Clear the highlight when the window gains focus. Window-scoped hook so it
-  // disappears with the window and never touches global tmux state.
+  // Clear the highlight when you select the window. Global after-select hooks
+  // fire on window/pane selection regardless of `focus-events` (a window-scoped
+  // pane-focus-in hook would need it). With no `-t`, the unset targets the
+  // just-selected window, so it only ever clears the window you opened.
   if (config.resetOnFocus) {
-    await tmux(
-      "set-hook",
-      "-w",
-      "-t",
-      windowId,
-      "pane-focus-in",
-      `set-window-option -t ${windowId} -u window-status-style`,
-    )
+    await tmux("set-hook", "-g", "after-select-window", "set-window-option -u window-status-style")
+    await tmux("set-hook", "-g", "after-select-pane", "set-window-option -u window-status-style")
   }
 
   await clearStyle()
