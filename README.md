@@ -14,9 +14,9 @@ OpenCode plugin that signals agent state in tmux — recolors **this pane's wind
 - **Working / focused → normal** — no highlight while you're looking at it
 - **Window naming** — renames the window to the project directory (`~/code/foo` → `foo`)
 - **Sub-agent aware** — events from sub-agents (child sessions) never flash your main window
-- **Mark-as-read** — focusing the window clears the highlight
+- **Mark-as-read** — opening the window clears the highlight
 
-The highlight only shows while the window is **inactive** (you're somewhere else), which is exactly when you need it. Come back to the window and it returns to normal.
+The highlight only shows while the window is **inactive** (you're somewhere else), which is exactly when you need it. Open the window and it clears.
 
 ## Why
 
@@ -50,7 +50,7 @@ All options are environment variables (set them in your shell profile). Defaults
 | `OPENCODE_TMUX_SIGNAL_DONE_BG` | `colour131` | Done background (soft red) |
 | `OPENCODE_TMUX_SIGNAL_DONE_FG` | `white` | Done text |
 | `OPENCODE_TMUX_SIGNAL_WINDOW_NAME` | `dir` | `dir` = rename window to project dir; `off` = leave it |
-| `OPENCODE_TMUX_SIGNAL_RESET_ON_FOCUS` | `on` | Clear the highlight when you focus the window |
+| `OPENCODE_TMUX_SIGNAL_RESET_ON_FOCUS` | `on` | Clear the highlight when you open the window |
 
 Colors accept any tmux color: `red`, `brightblue`, or `colour0`–`colour255`.
 
@@ -74,10 +74,10 @@ The plugin maps OpenCode events to states and styles only its own window:
 
 - The window is found once from `$TMUX_PANE`, so multi-pane layouts work correctly.
 - Sub-agent sessions (those with a `parentID`) are tracked and their events ignored, so a finishing sub-agent never flashes the main window.
-- `window-status-style` applies only to **inactive** windows, so the highlight is hidden while you're viewing the pane; a window-scoped `pane-focus-in` hook clears it once you return.
+- `window-status-style` applies only to **inactive** windows, so the highlight is hidden while you're viewing the pane; global `after-select-window` / `after-select-pane` hooks clear it the moment you open the window (works without `focus-events`).
 - Window naming sets `automatic-rename off` for that window only, then `rename-window` to the project basename.
 
-Requires tmux 3.2+ (for window-scoped hooks) and bash/Bun (provided by OpenCode).
+Requires tmux 3.0+ and Bun (provided by OpenCode).
 
 ## Development
 
