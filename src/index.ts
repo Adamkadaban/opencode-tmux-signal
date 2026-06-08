@@ -45,8 +45,10 @@ const config = {
   ),
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
   manageTmuxConf: env("MANAGE_TMUX_CONF", "on") !== "off",
-  maxLen: Math.max(1, parseInt(env("MAX_LEN", "12"), 10) || 12),
 }
+
+// Maximum tmux window-name length.
+const MAX_LEN = 8
 
 const DEFAULT_WINDOW_NAME = "opencode"
 const THROWAWAY_TITLE = "opencode-tmux-signal: window name"
@@ -75,7 +77,7 @@ const slugify = (raw: string): string => {
   const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
   const filler = new Set(["name", "the", "a", "an", "is", "for", "project", "task", "window"])
   const pick = toks.find((t) => !filler.has(t)) || toks[0] || ""
-  return pick.replace(/^-+|-+$/g, "").slice(0, config.maxLen)
+  return pick.replace(/^-+|-+$/g, "").slice(0, MAX_LEN)
 }
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
@@ -86,7 +88,7 @@ const dirFull = (dir: string): string =>
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-const dirName = (dir: string): string => dirFull(dir).slice(0, config.maxLen)
+const dirName = (dir: string): string => dirFull(dir).slice(0, MAX_LEN)
 
 
 // ---------------------------------------------------------------------------
@@ -211,7 +213,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       childSessions.add(tmpId)
       const system =
         "You name a tmux window for a coding session. Reply with ONLY one short lowercase token " +
-        `(a word, abbreviation, or acronym), max ${config.maxLen} characters, using only a-z, 0-9 and hyphens. ` +
+        `(a word, abbreviation, or acronym), max ${MAX_LEN} characters, using only a-z, 0-9 and hyphens. ` +
         "No spaces, quotes, punctuation, or explanation."
       const parts = [{ type: "text" as const, text: `Task: ${text.slice(0, 400)}` }]
       for (const model of models) {

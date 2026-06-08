@@ -18,7 +18,7 @@ Run [OpenCode](https://github.com/anomalyco/opencode) inside tmux and a row of i
 ## Highlights
 
 - **State at a glance** — permission (yellow), question (purple), done/error (soft red); nothing while working or focused.
-- **Smart window names** — names follow a priority: an old/resumed session uses its title, a brand-new session uses your first prompt, and the project directory name is only a fallback when an old session has no title. Names are short model slugs (capped by `MAX_LEN`), and a name you set yourself is never overwritten.
+- **Smart window names** — names follow a priority: an old/resumed session uses its title, a brand-new session uses your first prompt, and the project directory name is only a fallback when an old session has no title. Names are short model slugs (≤ 8 characters), and a name you set yourself is never overwritten.
 - **Mark-as-read** — opening the window clears the highlight (on keyboard *and* mouse, via `focus-events` + reset hooks).
 - **Sub-agent aware** — child-session events never flash the main window.
 - **Zero ceremony** — drives tmux at runtime from `$TMUX_PANE`, and sets up the small bit of tmux config it needs for you.
@@ -58,7 +58,6 @@ Everything is optional and set via environment variables. Defaults are a mellow 
 | `OPENCODE_TMUX_SIGNAL_QUESTION_BG` / `_FG` | `colour97` / `white` | Question colors (purple) |
 | `OPENCODE_TMUX_SIGNAL_DONE_BG` / `_FG` | `colour131` / `white` | Done/error colors (soft red) |
 | `OPENCODE_TMUX_SIGNAL_WINDOW_NAME` | `llm` | `llm` (slug), `dir` (project directory), or `off` |
-| `OPENCODE_TMUX_SIGNAL_MAX_LEN` | `12` | Maximum window-name length |
 | `OPENCODE_TMUX_SIGNAL_NAME_MODELS` | `github-copilot/gpt-5.4-mini, …claude-haiku-4.5, …gemini-3.5-flash` | `provider/model` list tried in order |
 | `OPENCODE_TMUX_SIGNAL_RESET_ON_FOCUS` | `on` | Clear the highlight when you open the window |
 | `OPENCODE_TMUX_SIGNAL_MANAGE_TMUX_CONF` | `on` | Manage the `~/.tmux.conf` block |
