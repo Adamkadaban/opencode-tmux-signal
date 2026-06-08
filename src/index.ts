@@ -45,6 +45,7 @@ const config = {
   ),
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
   manageTmuxConf: env("MANAGE_TMUX_CONF", "on") !== "off",
+  maxLen: Math.max(1, parseInt(env("MAX_LEN", "12"), 10) || 12),
 }
 
 const DEFAULT_WINDOW_NAME = "opencode"
@@ -74,16 +75,18 @@ const slugify = (raw: string): string => {
   const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
   const filler = new Set(["name", "the", "a", "an", "is", "for", "project", "task", "window"])
   const pick = toks.find((t) => !filler.has(t)) || toks[0] || ""
-  return pick.replace(/^-+|-+$/g, "").slice(0, 12)
+  return pick.replace(/^-+|-+$/g, "").slice(0, config.maxLen)
 }
 
-// Provisional window name from the project directory (lowercased basename).
-const dirName = (dir: string): string =>
+// Project directory as a window name. `dirFull` is the untruncated lowercased
+// basename (used to recognize a window we previously named after the dir, even
+// if the length limit changed); `dirName` applies the configured length cap.
+const dirFull = (dir: string): string =>
   basename(dir || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 20)
+const dirName = (dir: string): string => dirFull(dir).slice(0, config.maxLen)
 
 
 // ---------------------------------------------------------------------------
@@ -173,8 +176,19 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   const renameIfOurs = async (name: string): Promise<void> => {
     if (!name) return
     const cur = await tmuxOut("display-message", "-p", "-t", windowId, "#{window_name}")
-    if (cur !== DEFAULT_WINDOW_NAME && cur !== ourName && !PROCESS_NAMES.has(cur)) {
+    const d = worktree || directory
+    const ours =
+      cur === DEFAULT_WINDOW_NAME ||
+      cur === ourName ||
+      PROCESS_NAMES.has(cur) ||
+      cur === dirName(d) ||
+      cur === dirFull(d)
+    if (!ours) {
       dbg("rename skip: custom window name", JSON.stringify(cur))
+      return
+    }
+    if (cur === name) {
+      ourName = name
       return
     }
     await tmux("set-window-option", "-t", windowId, "automatic-rename", "off")
@@ -197,7 +211,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       childSessions.add(tmpId)
       const system =
         "You name a tmux window for a coding session. Reply with ONLY one short lowercase token " +
-        "(a word, abbreviation, or acronym), max 10 characters, using only a-z, 0-9 and hyphens. " +
+        `(a word, abbreviation, or acronym), max ${config.maxLen} characters, using only a-z, 0-9 and hyphens. ` +
         "No spaces, quotes, punctuation, or explanation."
       const parts = [{ type: "text" as const, text: `Task: ${text.slice(0, 400)}` }]
       for (const model of models) {
@@ -229,34 +243,50 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     }
   }
 
-  // Name the window for `sessionID`. New session (no real title yet) -> use the
-  // first prompt; resumed session (already titled) -> use the existing title.
-  let namedSession: string | null = null
+  // Name the window for `sessionID`, in priority order:
+  //   1. real session title (a resumed/named session)
+  //   2. the first prompt (a brand-new session)
+  //   3. the project directory name — only as a fallback for an *old* session
+  //      that has no title yet (a brand-new session waits for its prompt instead).
+  const startTime = Date.now()
+  let contentSession: string | null = null // named from title/prompt (final)
+  let dirSession: string | null = null // named from the directory (upgradable)
   const nameSession = async (sessionID?: string, promptText?: string, fallbackModel?: ModelRef): Promise<void> => {
     if (!llmMode || !sessionID) return
-    if (childSessions.has(sessionID) || sessionID === namedSession) return
-    namedSession = sessionID
+    if (childSessions.has(sessionID) || sessionID === contentSession) return
     try {
       let title = ""
+      let createdAt = 0
       try {
         const s = await client.session.get({ path: { id: sessionID } })
         title = (s?.data?.title || "").trim()
+        createdAt = s?.data?.time?.created || 0
       } catch {
         /* ignore */
       }
       if (title === THROWAWAY_TITLE) {
         childSessions.add(sessionID)
-        namedSession = null
         return
       }
-      const text = (isRealTitle(title) ? title : "") || (promptText || "").trim()
-      if (!text) {
-        namedSession = null
+      const content = (isRealTitle(title) ? title : "") || (promptText || "").trim()
+      if (content) {
+        contentSession = sessionID // claim before the async model call
+        const slug = await llmSlug(content, fallbackModel)
+        dbg("nameSession content", sessionID, "->", JSON.stringify(slug))
+        if (slug) await renameIfOurs(slug)
+        else contentSession = null
         return
       }
-      const slug = await llmSlug(text, fallbackModel)
-      dbg("nameSession", sessionID, "->", JSON.stringify(slug))
-      if (slug) await renameIfOurs(slug)
+      // No title and no prompt. Fall back to the directory only for a session
+      // that existed before this opencode started (a resume); a brand-new
+      // session waits for its first prompt.
+      const resumed = createdAt > 0 && createdAt < startTime - 30000
+      if (resumed && dirSession !== sessionID) {
+        dirSession = sessionID
+        const dn = dirName(worktree || directory)
+        dbg("nameSession dir-fallback", sessionID, "->", JSON.stringify(dn))
+        if (dn) await renameIfOurs(dn)
+      }
     } catch (e) {
       dbg("nameSession error", String(e).slice(0, 160))
     }
@@ -266,10 +296,9 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
 
   ensureTmuxConf(config.manageTmuxConf)
 
-  // Provisional name: the project directory. In llm mode this is upgraded to a
-  // short model slug once a real prompt or title exists; a resumed empty session
-  // (no prompt, placeholder title) keeps the directory name instead of "opencode".
-  if (config.windowName !== "off") {
+  // In "dir" mode the window is named after the project directory up front.
+  // In "llm" mode naming is driven by nameSession (title / prompt / dir fallback).
+  if (config.windowName === "dir") {
     await renameIfOurs(dirName(worktree || directory) || DEFAULT_WINDOW_NAME)
   }
 
@@ -291,14 +320,13 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
 
   if (llmMode) {
     // Startup probe: name a resumed/idle session that emits no events on its own.
+    // nameSession applies the priority (title -> prompt -> dir fallback for old).
     setTimeout(async () => {
-      if (namedSession) return
+      if (contentSession) return
       try {
         const list = await client.session.list()
         const cands = ((list?.data ?? []) as any[])
-          .filter(
-            (s) => !s.parentID && (s.directory === directory || s.directory === worktree) && isRealTitle(s.title),
-          )
+          .filter((s) => !s.parentID && (s.directory === directory || s.directory === worktree))
           .sort((a, b) => (b.time?.updated || 0) - (a.time?.updated || 0))
         if (cands[0]) await nameSession(cands[0].id)
       } catch (e) {
