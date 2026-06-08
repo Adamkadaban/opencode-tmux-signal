@@ -77,6 +77,15 @@ const slugify = (raw: string): string => {
   return pick.replace(/^-+|-+$/g, "").slice(0, 12)
 }
 
+// Provisional window name from the project directory (lowercased basename).
+const dirName = (dir: string): string =>
+  basename(dir || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 20)
+
+
 // ---------------------------------------------------------------------------
 // Persistent tmux setup (idempotent managed block in ~/.tmux.conf)
 // ---------------------------------------------------------------------------
@@ -257,8 +266,11 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
 
   ensureTmuxConf(config.manageTmuxConf)
 
-  if (config.windowName === "dir") {
-    await renameIfOurs(basename(worktree || directory || "") || DEFAULT_WINDOW_NAME)
+  // Provisional name: the project directory. In llm mode this is upgraded to a
+  // short model slug once a real prompt or title exists; a resumed empty session
+  // (no prompt, placeholder title) keeps the directory name instead of "opencode".
+  if (config.windowName !== "off") {
+    await renameIfOurs(dirName(worktree || directory) || DEFAULT_WINDOW_NAME)
   }
 
   if (config.resetOnFocus) {

@@ -18,7 +18,7 @@ Run [OpenCode](https://github.com/anomalyco/opencode) inside tmux and a row of i
 ## Highlights
 
 - **State at a glance** — permission (yellow), question (purple), done/error (soft red); nothing while working or focused.
-- **Smart window names** — a cheap model turns your first prompt into a short slug (`fix the auth token bug` → `auth`); resumed sessions use their existing title. Never overwrites a name you set.
+- **Smart window names** — a cheap model turns your first prompt into a short slug (`fix the auth token bug` → `auth`); resumed sessions use their existing title, and an empty session falls back to the project directory name. Never overwrites a name you set.
 - **Mark-as-read** — opening the window clears the highlight (on keyboard *and* mouse, via `focus-events` + reset hooks).
 - **Sub-agent aware** — child-session events never flash the main window.
 - **Zero ceremony** — drives tmux at runtime from `$TMUX_PANE`, and sets up the small bit of tmux config it needs for you.
@@ -69,7 +69,7 @@ Colors accept any tmux color: `red`, `brightblue`, or `colour0`–`colour255`.
 
 - The window is resolved once from `$TMUX_PANE`, so multi-pane layouts target the right window.
 - State is colored with `window-status-style`, which only shows on **inactive** windows; a `pane-focus-in` / `after-select` hook clears it when you open the window.
-- Naming runs a throwaway model call in a temporary session (deleted right after) and only renames a window whose name is still a bare process name (`opencode`, `nano`, …) — never a custom one.
+- Naming starts from the project directory, then upgrades to a short model slug once there's a real prompt or title. The model call runs in a throwaway session (deleted right after), and it only renames a window whose name is still a bare process name (`opencode`, `nano`, …) — never a custom one.
 - Sub-agent sessions (those with a `parentID`) are tracked and ignored, so a finishing sub-agent never flashes the main window.
 
 ## Development
