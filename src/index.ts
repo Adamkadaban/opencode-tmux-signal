@@ -60,17 +60,18 @@ const BUILTIN_MODELS: ModelRef[] = [
 const DEFAULT_WINDOW_NAME = "opencode"
 const THROWAWAY_TITLE = "opencode-tmux-signal: window name"
 
-// opencode's placeholder title ("New session - <ts>") and the throwaway title
-// aren't meaningful — don't name a window from them.
-const isRealTitle = (t?: string): boolean => {
-  const s = (t || "").trim()
-  return s !== "" && s !== THROWAWAY_TITLE && !/^new session\b/i.test(s)
-}
-
 // Generic words a model might emit for a vague title — reject and try the next.
 const BAD_SLUGS = new Set([
   "session", "new", "untitled", "opencode", "window", "name", "task", "project", "chat", "agent", "code",
+  "done", "complete", "completed", "finish", "finished", "idle",
 ])
+
+// opencode's placeholder title ("New session - <ts>"), generic status titles,
+// and the throwaway title aren't meaningful — don't name a window from them.
+const isRealTitle = (t?: string): boolean => {
+  const s = (t || "").trim()
+  return s !== "" && s !== THROWAWAY_TITLE && !/^new session\b/i.test(s) && !BAD_SLUGS.has(slugify(s))
+}
 
 // Bare process names tmux's automatic-rename may show. If a window shows one of
 // these (or "opencode", or a name we set), it isn't a custom name the user
@@ -85,6 +86,17 @@ const slugify = (raw: string): string => {
   const filler = new Set(["name", "the", "a", "an", "is", "for", "project", "task", "window"])
   const pick = toks.find((t) => !filler.has(t)) || toks[0] || ""
   return pick.replace(/^-+|-+$/g, "").slice(0, 40)
+}
+
+const fastTitleSlug = (raw: string): string => {
+  const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
+  const filler = new Set([
+    "a", "an", "and", "for", "from", "in", "into", "is", "of", "on", "the", "to", "with",
+    "add", "build", "create", "debug", "fix", "implement", "make", "update", "use", "using",
+    "name", "project", "task", "window",
+  ])
+  const pick = toks.find((t) => !filler.has(t) && !BAD_SLUGS.has(t) && t.length <= MAX_LEN) || ""
+  return pick.replace(/^-+|-+$/g, "")
 }
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
@@ -314,11 +326,25 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
         childSessions.add(sessionID)
         return
       }
-      const content = (isRealTitle(title) ? title : "") || (promptText || "").trim()
-      if (content) {
+      if (isRealTitle(title)) {
+        contentSession = sessionID // claim before the async model call
+        const quick = fastTitleSlug(title)
+        if (quick) {
+          dbg("nameSession fast-title", sessionID, "->", JSON.stringify(quick))
+          await renameIfOurs(quick)
+          return
+        }
+        const slug = await llmSlug(title, fallbackModel)
+        dbg("nameSession title", sessionID, "->", JSON.stringify(slug))
+        if (slug) await renameIfOurs(slug)
+        else contentSession = null
+        return
+      }
+      const content = (promptText || "").trim()
+      if (content && !BAD_SLUGS.has(slugify(content))) {
         contentSession = sessionID // claim before the async model call
         const slug = await llmSlug(content, fallbackModel)
-        dbg("nameSession content", sessionID, "->", JSON.stringify(slug))
+        dbg("nameSession prompt", sessionID, "->", JSON.stringify(slug))
         if (slug) await renameIfOurs(slug)
         else contentSession = null
         return
@@ -367,7 +393,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   if (llmMode) {
     // Startup probe: name a resumed/idle session that emits no events on its own.
     // nameSession applies the priority (title -> prompt -> dir fallback for old).
-    setTimeout(async () => {
+    const startupProbe = async () => {
       if (contentSession) return
       try {
         const list = await client.session.list()
@@ -378,7 +404,9 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       } catch (e) {
         dbg("startup probe error", String(e).slice(0, 160))
       }
-    }, 1500)
+    }
+    setTimeout(startupProbe, 100)
+    setTimeout(startupProbe, 1000)
   }
 
   // --- state machine -------------------------------------------------------
