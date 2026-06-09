@@ -70,7 +70,8 @@ const BAD_SLUGS = new Set([
 // and the throwaway title aren't meaningful — don't name a window from them.
 const isRealTitle = (t?: string): boolean => {
   const s = (t || "").trim()
-  return s !== "" && s !== THROWAWAY_TITLE && !/^new session\b/i.test(s) && !BAD_SLUGS.has(slugify(s))
+  const slug = slugify(s)
+  return s !== "" && s !== THROWAWAY_TITLE && !/^new session\b/i.test(s) && slug.length > 1 && !BAD_SLUGS.has(slug)
 }
 
 // Bare process names tmux's automatic-rename may show. If a window shows one of
@@ -88,15 +89,30 @@ const slugify = (raw: string): string => {
   return pick.replace(/^-+|-+$/g, "").slice(0, 40)
 }
 
+const goodSlug = (slug: string): boolean => slug.length > 1 && slug.length <= MAX_LEN && !BAD_SLUGS.has(slug)
+
 const fastTitleSlug = (raw: string): string => {
   const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
   const filler = new Set([
     "a", "an", "and", "for", "from", "in", "into", "is", "of", "on", "the", "to", "with",
-    "add", "build", "create", "debug", "fix", "implement", "make", "update", "use", "using",
+    "add", "build", "check", "create", "debug", "fix", "implement", "list", "make", "open", "read", "summarize", "summary", "update", "use", "using",
+    "home", "tmp", "file", "files", "folder", "directory", "dir", "another", "something",
     "name", "project", "task", "window",
   ])
   const pick = toks.find((t) => !filler.has(t) && !BAD_SLUGS.has(t) && t.length <= MAX_LEN) || ""
   return pick.replace(/^-+|-+$/g, "")
+}
+
+const fastPromptSlug = (raw: string): string => {
+  const path = raw.match(/(?:~|\.{1,2}|\/)[^\s'"`)]+/)
+  if (path) {
+    const clean = path[0].replace(/[.,;:!?]+$/g, "")
+    const base = basename(clean).replace(/^\.+/, "")
+    const slug = slugify(base)
+    if (goodSlug(slug)) return slug
+  }
+  const slug = fastTitleSlug(raw)
+  return goodSlug(slug) ? slug : ""
 }
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
@@ -289,14 +305,15 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
           const slug = slugify(textParts(res))
           dbg("llmSlug", `${model.providerID}/${model.modelID}`, "->", JSON.stringify(slug), `(len ${slug.length})`)
           if (slug && !BAD_SLUGS.has(slug)) {
-            if (slug.length <= MAX_LEN) return slug
+            if (goodSlug(slug)) return slug
             if (!best) best = slug // remember in case nothing fits, as a last resort
           }
         } catch (e) {
           dbg("llmSlug model failed", `${model.providerID}/${model.modelID}`, String(e).slice(0, 120))
         }
       }
-      return best ? best.slice(0, MAX_LEN) : ""
+      const fallback = best.slice(0, MAX_LEN)
+      return fallback.length > 1 && !BAD_SLUGS.has(fallback) ? fallback : ""
     } catch (e) {
       dbg("llmSlug error", String(e).slice(0, 160))
       return ""
@@ -353,6 +370,12 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       const content = (promptText || "").trim()
       if (content && !BAD_SLUGS.has(slugify(content))) {
         contentSession = sessionID // claim before the async model call
+        const quick = fastPromptSlug(content)
+        if (quick) {
+          dbg("nameSession fast-prompt", sessionID, "->", JSON.stringify(quick))
+          await renameIfOurs(quick)
+          return
+        }
         const slug = await llmSlug(content, fallbackModel)
         dbg("nameSession prompt", sessionID, "->", JSON.stringify(slug))
         if (slug) await renameIfOurs(slug)
@@ -428,7 +451,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     (await tmuxOut("display-message", "-p", "-t", windowId, "#{window_active}")) === "1"
 
   const setState = async (state: State): Promise<void> => {
-    if (state === lastState) return
+    if (state !== lastState) dbg("state", lastState, "->", state)
     lastState = state
     const style =
       state === "permission" ? config.permission : state === "question" ? config.question : state === "done" ? config.done : null
@@ -437,6 +460,18 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     if (style && !(await isWindowActive())) await applyStyle(style)
     else await clearStyle()
   }
+
+  // OpenCode 1.16.2 does not invoke the documented permission.ask hook for
+  // external-directory prompts in the TUI. Watch the pane text as a fallback so
+  // background windows still get the permission color while waiting for input.
+  const pollPermissionPrompt = async (): Promise<void> => {
+    const text = await tmuxOut("capture-pane", "-p", "-t", pane, "-S", "-80")
+    const waiting = /Permission required|Allow once\s+Allow always\s+Reject/.test(text)
+    if (waiting) await setState("permission")
+    else if (lastState === "permission") await setState("running")
+  }
+  const permissionPoll = setInterval(() => void pollPermissionPrompt(), 500)
+  ;(permissionPoll as any).unref?.()
 
   return {
     event: async ({ event }) => {
@@ -481,6 +516,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     },
 
     "permission.ask": async () => {
+      dbg("permission.ask hook")
       await setState("permission")
     },
     "tool.execute.before": async (input: { tool: string }) => {
