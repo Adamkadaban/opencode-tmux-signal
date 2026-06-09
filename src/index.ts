@@ -5,6 +5,26 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync } from "node:fs
 
 const PREFIX = "OPENCODE_TMUX_SIGNAL_"
 const env = (key: string, fallback: string): string => process.env[PREFIX + key] ?? fallback
+const envInt = (key: string, fallback: number, min: number, max: number): number => {
+  const n = Number.parseInt(env(key, String(fallback)), 10)
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
+}
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | undefined> => {
+  if (ms <= 0) return undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms)
+    ;(timer as any).unref?.()
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+const elapsed = (start: number): string => `${Date.now() - start}ms`
 
 const DEBUG = (process.env[PREFIX + "DEBUG"] ?? "") !== ""
 const dbg: (...a: unknown[]) => void = DEBUG
@@ -41,6 +61,7 @@ const config = {
   // model selection prefers opencode's small_model, then a built-in fast list,
   // then the session's own model.
   nameModels: parseModels(env("NAME_MODELS", "")),
+  nameTimeoutMs: envInt("NAME_TIMEOUT_MS", 7000, 1000, 10000),
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
   manageTmuxConf: env("MANAGE_TMUX_CONF", "on") !== "off",
 }
@@ -52,10 +73,13 @@ const MAX_LEN = 8
 // can't access simply errors and the next is tried; for non-listed providers,
 // the configured small_model and the session's own model cover it.
 const BUILTIN_MODELS: ModelRef[] = [
-  { providerID: "github-copilot", modelID: "gpt-5-mini" },
   { providerID: "github-copilot", modelID: "claude-haiku-4.5" },
-  { providerID: "github-copilot", modelID: "gemini-3.5-flash" },
+  { providerID: "github-copilot", modelID: "gpt-4o-mini" },
+  { providerID: "github-copilot", modelID: "gpt-5-mini" },
+  { providerID: "github-copilot", modelID: "gemini-3-flash-preview" },
 ]
+
+const MODEL_PROMPT_TIMEOUT_MS = 2500
 
 const DEFAULT_WINDOW_NAME = "opencode"
 const THROWAWAY_TITLE = "opencode-tmux-signal: window name"
@@ -91,19 +115,14 @@ const slugify = (raw: string): string => {
 
 const goodSlug = (slug: string): boolean => slug.length > 1 && slug.length <= MAX_LEN && !BAD_SLUGS.has(slug)
 
-const fastTitleSlug = (raw: string): string => {
-  const toks = (raw || "").toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) || []
-  const filler = new Set([
-    "a", "an", "and", "for", "from", "in", "into", "is", "of", "on", "the", "to", "with",
-    "add", "build", "check", "create", "debug", "fix", "implement", "list", "make", "open", "read", "summarize", "summary", "update", "use", "using",
-    "home", "tmp", "file", "files", "folder", "directory", "dir", "another", "something",
-    "name", "project", "task", "window",
-  ])
-  const pick = toks.find((t) => !filler.has(t) && !BAD_SLUGS.has(t) && t.length <= MAX_LEN) || ""
-  return pick.replace(/^-+|-+$/g, "")
-}
+const STOPWORDS = new Set([
+  "about", "after", "again", "all", "also", "and", "anything", "are", "around", "ask", "bad", "because", "been", "but", "can", "could",
+  "did", "does", "doing", "explain", "for", "from", "gave", "get", "got", "had", "has", "have", "help", "into", "just", "like",
+  "long", "make", "more", "much", "need", "not", "one", "please", "prompt", "really", "should", "some", "stuff", "that", "the", "their",
+  "then", "there", "things", "this", "title", "titles", "very", "was", "what", "when", "where", "which", "while", "why", "with", "would",
+])
 
-const fastPromptSlug = (raw: string): string => {
+const fastStructuredSlug = (raw: string): string => {
   const path = raw.match(/(?:~|\.{1,2}|\/)[^\s'"`)]+/)
   if (path) {
     const clean = path[0].replace(/[.,;:!?]+$/g, "")
@@ -111,8 +130,31 @@ const fastPromptSlug = (raw: string): string => {
     const slug = slugify(base)
     if (goodSlug(slug)) return slug
   }
-  const slug = fastTitleSlug(raw)
-  return goodSlug(slug) ? slug : ""
+  return ""
+}
+
+const fallbackPromptSlug = (raw: string): string => {
+  const text = (raw || "").toLowerCase()
+  const topic = text.match(/\b(?:about|regarding|around|for)\s+([a-z0-9][a-z0-9-]*)/)
+  if (topic) {
+    const slug = slugify(topic[1])
+    if (goodSlug(slug) && !STOPWORDS.has(slug)) return slug
+  }
+  const toks = text.match(/[a-z0-9][a-z0-9-]*/g) || []
+  let best = ""
+  let bestScore = -1
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i]
+    if (t.length > MAX_LEN || t.length < 3 || STOPWORDS.has(t) || BAD_SLUGS.has(t)) continue
+    let score = t.length
+    if (/\d/.test(t)) score += 2
+    if (i > 0 && ["about", "regarding", "around", "for"].includes(toks[i - 1])) score += 20
+    if (score > bestScore) {
+      best = t
+      bestScore = score
+    }
+  }
+  return goodSlug(best) ? best : ""
 }
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
@@ -209,19 +251,38 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     }
   }
 
-  const windowId = await tmuxOut("display-message", "-p", "-t", pane, "#{window_id}")
-  if (!windowId) return {}
+  let windowId = ""
+  let resolveInit: (ok: boolean) => void = () => {}
+  let initDone = false
+  let initOk = false
+  const initReady = new Promise<boolean>((resolve) => {
+    resolveInit = resolve
+  })
+  const finishInit = (ok: boolean): boolean => {
+    if (!initDone) {
+      initDone = true
+      initOk = ok
+      resolveInit(ok)
+    }
+    return ok
+  }
+  const timeLeft = (deadline: number): number => Math.max(0, deadline - Date.now())
+  const waitForInit = async (deadline: number): Promise<boolean> => {
+    if (initDone) return initOk
+    return (await withTimeout(initReady, timeLeft(deadline))) === true
+  }
 
   const applyStyle = (s: Style) =>
-    tmux("set-window-option", "-t", windowId, "window-status-style", `bg=${s.bg},fg=${s.fg}`)
-  const clearStyle = () => tmux("set-window-option", "-t", windowId, "-u", "window-status-style")
+    windowId ? tmux("set-window-option", "-t", windowId, "window-status-style", `bg=${s.bg},fg=${s.fg}`) : Promise.resolve()
+  const clearStyle = () => windowId ? tmux("set-window-option", "-t", windowId, "-u", "window-status-style") : Promise.resolve()
 
   const llmMode = config.windowName === "llm"
   const childSessions = new Set<string>()
 
   let ourName: string | null = null
-  const renameIfOurs = async (name: string): Promise<void> => {
+  const renameIfOurs = async (name: string, deadline = Date.now() + config.nameTimeoutMs): Promise<void> => {
     if (!name) return
+    if (!(await waitForInit(deadline))) return
     const cur = await tmuxOut("display-message", "-p", "-t", windowId, "#{window_name}")
     const d = worktree || directory
     const ours =
@@ -254,13 +315,16 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   // Resolve naming models, preferring a subscription-appropriate small model:
   // explicit override -> opencode's configured small_model -> built-in fast list
   // -> the session's own model (always usable with the active subscription).
-  const resolveModels = async (sessionModel?: ModelRef): Promise<ModelRef[]> => {
+  const resolveModels = async (sessionModel?: ModelRef, deadline = Date.now() + config.nameTimeoutMs): Promise<ModelRef[]> => {
+    const start = Date.now()
     const out: ModelRef[] = []
     if (config.nameModels.length) {
       config.nameModels.forEach((m) => dedupeAdd(out, m))
     } else {
       try {
-        const c = await client.config.get()
+        const left = timeLeft(deadline)
+        const c = left > 0 ? await withTimeout(client.config.get(), left) : undefined
+        if (!c) dbg("resolveModels config timeout", elapsed(start))
         dedupeAdd(out, parseModel((c?.data as any)?.small_model))
       } catch {
         /* ignore */
@@ -268,6 +332,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
       BUILTIN_MODELS.forEach((m) => dedupeAdd(out, m))
     }
     dedupeAdd(out, sessionModel)
+    dbg("resolveModels", out.map((m) => `${m.providerID}/${m.modelID}`).join(","), elapsed(start))
     return out
   }
 
@@ -277,31 +342,40 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   // Ask a model for a window-name slug. The model is told to keep it <= MAX_LEN;
   // if it returns something longer we reject it and ask again (trying the next
   // model / a stronger instruction) rather than blindly truncating.
-  const llmSlug = async (text: string, sessionModel?: ModelRef): Promise<string> => {
-    const models = await resolveModels(sessionModel)
+  const llmSlug = async (text: string, sessionModel?: ModelRef, deadline = Date.now() + config.nameTimeoutMs): Promise<string> => {
+    const start = Date.now()
+    const models = await resolveModels(sessionModel, deadline)
     if (!models.length) return ""
-    let tmpId: string | undefined
     try {
-      const created = await client.session.create({ body: { title: THROWAWAY_TITLE } })
-      tmpId = created?.data?.id
-      if (!tmpId) return ""
-      childSessions.add(tmpId)
       const base =
         "You name a tmux window for a coding session. Reply with ONLY one lowercase token " +
         `(a word, abbreviation, or acronym), ${MAX_LEN} characters or fewer, using only a-z, 0-9 and hyphens. ` +
         "No spaces, quotes, punctuation, or explanation."
       const userText = `Task: ${text.slice(0, 400)}`
       let best = ""
-      const maxAttempts = Math.min(5, models.length + 2)
-      for (let i = 0; i < maxAttempts; i++) {
-        const model = models[Math.min(i, models.length - 1)]
+      for (let i = 0; i < models.length; i++) {
+        let tmpId = ""
+        const model = models[i]
         const system =
           i === 0 ? base : `${base} Your previous answer was too long — it MUST be ${MAX_LEN} characters or fewer; abbreviate or use an acronym.`
         try {
-          const res = await client.session.prompt({
+          if (timeLeft(deadline) <= 0) break
+          const created = await withTimeout(client.session.create({ body: { title: THROWAWAY_TITLE } }), Math.min(500, timeLeft(deadline)))
+          if (!created?.data?.id) {
+            dbg("llmSlug create timeout", `${model.providerID}/${model.modelID}`, elapsed(start))
+            continue
+          }
+          tmpId = created.data.id
+          childSessions.add(tmpId)
+          const attemptMs = Math.min(MODEL_PROMPT_TIMEOUT_MS, timeLeft(deadline))
+          const res = await withTimeout(client.session.prompt({
             path: { id: tmpId },
             body: { model, system, parts: [{ type: "text" as const, text: userText }] },
-          })
+          }), attemptMs)
+          if (!res) {
+            dbg("llmSlug prompt timeout", `${model.providerID}/${model.modelID}`, elapsed(start))
+            continue
+          }
           const slug = slugify(textParts(res))
           dbg("llmSlug", `${model.providerID}/${model.modelID}`, "->", JSON.stringify(slug), `(len ${slug.length})`)
           if (slug && !BAD_SLUGS.has(slug)) {
@@ -310,21 +384,16 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
           }
         } catch (e) {
           dbg("llmSlug model failed", `${model.providerID}/${model.modelID}`, String(e).slice(0, 120))
+        } finally {
+          if (tmpId) void client.session.delete({ path: { id: tmpId } }).catch(() => {})
         }
       }
       const fallback = best.slice(0, MAX_LEN)
+      if (!fallback) dbg("llmSlug no usable slug", elapsed(start))
       return fallback.length > 1 && !BAD_SLUGS.has(fallback) ? fallback : ""
     } catch (e) {
       dbg("llmSlug error", String(e).slice(0, 160))
       return ""
-    } finally {
-      if (tmpId) {
-        try {
-          await client.session.delete({ path: { id: tmpId } })
-        } catch {
-          /* ignore */
-        }
-      }
     }
   }
 
@@ -336,14 +405,19 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   const startTime = Date.now()
   let contentSession: string | null = null // named from title/prompt (final)
   let dirSession: string | null = null // named from the directory (upgradable)
+  const namingSessions = new Set<string>()
   const nameSession = async (sessionID?: string, promptText?: string, fallbackModel?: ModelRef): Promise<void> => {
     if (!llmMode || !sessionID) return
-    if (childSessions.has(sessionID) || sessionID === contentSession) return
+    if (childSessions.has(sessionID) || sessionID === contentSession || namingSessions.has(sessionID)) return
+    namingSessions.add(sessionID)
+    const deadline = Date.now() + config.nameTimeoutMs
     try {
+      if (!(await waitForInit(deadline))) return
       let title = ""
       let createdAt = 0
       try {
-        const s = await client.session.get({ path: { id: sessionID } })
+        const left = timeLeft(deadline)
+        const s = left > 0 ? await withTimeout(client.session.get({ path: { id: sessionID } }), left) : undefined
         title = (s?.data?.title || "").trim()
         createdAt = s?.data?.time?.created || 0
       } catch {
@@ -353,93 +427,106 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
         childSessions.add(sessionID)
         return
       }
-      if (isRealTitle(title)) {
+      const resumed = createdAt > 0 && createdAt < startTime - 30000
+      if (resumed && isRealTitle(title)) {
         contentSession = sessionID // claim before the async model call
-        const quick = fastTitleSlug(title)
+        const quick = fastStructuredSlug(title)
         if (quick) {
           dbg("nameSession fast-title", sessionID, "->", JSON.stringify(quick))
-          await renameIfOurs(quick)
+          await renameIfOurs(quick, deadline)
           return
         }
-        const slug = await llmSlug(title, fallbackModel)
+        const slug = (await llmSlug(title, fallbackModel, deadline)) || fallbackPromptSlug(title)
         dbg("nameSession title", sessionID, "->", JSON.stringify(slug))
-        if (slug) await renameIfOurs(slug)
+        if (slug) await renameIfOurs(slug, deadline)
         else contentSession = null
         return
       }
       const content = (promptText || "").trim()
       if (content && !BAD_SLUGS.has(slugify(content))) {
         contentSession = sessionID // claim before the async model call
-        const quick = fastPromptSlug(content)
+        const quick = fastStructuredSlug(content)
         if (quick) {
           dbg("nameSession fast-prompt", sessionID, "->", JSON.stringify(quick))
-          await renameIfOurs(quick)
+          await renameIfOurs(quick, deadline)
           return
         }
-        const slug = await llmSlug(content, fallbackModel)
+        const slug = (await llmSlug(content, fallbackModel, deadline)) || fallbackPromptSlug(content)
         dbg("nameSession prompt", sessionID, "->", JSON.stringify(slug))
-        if (slug) await renameIfOurs(slug)
+        if (slug) await renameIfOurs(slug, deadline)
         else contentSession = null
         return
       }
       // No title and no prompt. Fall back to the directory only for a session
       // that existed before this opencode started (a resume); a brand-new
       // session waits for its first prompt.
-      const resumed = createdAt > 0 && createdAt < startTime - 30000
       if (resumed && dirSession !== sessionID) {
         dirSession = sessionID
         const dn = dirName(worktree || directory)
         dbg("nameSession dir-fallback", sessionID, "->", JSON.stringify(dn))
-        if (dn) await renameIfOurs(dn)
+        if (dn) await renameIfOurs(dn, deadline)
       }
     } catch (e) {
       dbg("nameSession error", String(e).slice(0, 160))
+    } finally {
+      namingSessions.delete(sessionID)
     }
   }
 
   // --- one-time setup ------------------------------------------------------
 
-  ensureTmuxConf(config.manageTmuxConf)
-
-  // In "dir" mode the window is named after the project directory up front.
-  // In "llm" mode naming is driven by nameSession (title / prompt / dir fallback).
-  if (config.windowName === "dir") {
-    await renameIfOurs(dirName(worktree || directory) || DEFAULT_WINDOW_NAME)
-  }
-
-  if (config.resetOnFocus) {
-    await tmux("set-option", "-g", "focus-events", "on")
-    await tmux("set-hook", "-g", "after-select-window", "set-window-option -u window-status-style")
-    await tmux("set-hook", "-g", "after-select-pane", "set-window-option -u window-status-style")
-    await tmux(
-      "set-hook",
-      "-w",
-      "-t",
-      windowId,
-      "pane-focus-in",
-      `set-window-option -t ${windowId} -u window-status-style`,
-    )
-  }
-
-  await clearStyle()
-
-  if (llmMode) {
-    const resumedSessionID = explicitSessionID()
-    // Startup probe: name an explicitly resumed/idle session that emits no
-    // events on its own. A plain blank session must not inherit the latest
-    // historical session name from the same directory.
-    // nameSession applies the priority (title -> prompt -> dir fallback for old).
-    const startupProbe = async () => {
-      if (contentSession || !resumedSessionID) return
-      try {
-        await nameSession(resumedSessionID)
-      } catch (e) {
-        dbg("startup probe error", String(e).slice(0, 160))
-      }
+  void (async () => {
+    windowId = await tmuxOut("display-message", "-p", "-t", pane, "#{window_id}")
+    if (!windowId) {
+      finishInit(false)
+      return
     }
-    setTimeout(startupProbe, 100)
-    setTimeout(startupProbe, 1000)
-  }
+    finishInit(true)
+    ensureTmuxConf(config.manageTmuxConf)
+
+    // In "dir" mode the window is named after the project directory up front.
+    // In "llm" mode naming is driven by nameSession (title / prompt / dir fallback).
+    if (config.windowName === "dir") {
+      await renameIfOurs(dirName(worktree || directory) || DEFAULT_WINDOW_NAME)
+    }
+
+    if (config.resetOnFocus) {
+      await tmux("set-option", "-g", "focus-events", "on")
+      await tmux("set-hook", "-g", "after-select-window", "set-window-option -u window-status-style")
+      await tmux("set-hook", "-g", "after-select-pane", "set-window-option -u window-status-style")
+      await tmux(
+        "set-hook",
+        "-w",
+        "-t",
+        windowId,
+        "pane-focus-in",
+        `set-window-option -t ${windowId} -u window-status-style`,
+      )
+    }
+
+    await clearStyle()
+
+    if (llmMode) {
+      const resumedSessionID = explicitSessionID()
+      // Startup probe: name an explicitly resumed/idle session that emits no
+      // events on its own. A plain blank session must not inherit the latest
+      // historical session name from the same directory.
+      // nameSession applies the priority (title -> prompt -> dir fallback for old).
+      const startupProbe = async () => {
+        if (contentSession || !resumedSessionID) return
+        try {
+          await nameSession(resumedSessionID)
+        } catch (e) {
+          dbg("startup probe error", String(e).slice(0, 160))
+        }
+      }
+      setTimeout(startupProbe, 100)
+      setTimeout(startupProbe, 1000)
+    }
+  })().catch((e) => {
+    dbg("init error", String(e).slice(0, 160))
+    finishInit(false)
+  })
 
   // --- state machine -------------------------------------------------------
 
@@ -451,6 +538,8 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     (await tmuxOut("display-message", "-p", "-t", windowId, "#{window_active}")) === "1"
 
   const setState = async (state: State): Promise<void> => {
+    const deadline = Date.now() + 1000
+    if (!(await waitForInit(deadline))) return
     if (state !== lastState) dbg("state", lastState, "->", state)
     lastState = state
     const style =

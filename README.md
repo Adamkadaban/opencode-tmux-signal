@@ -59,6 +59,7 @@ Everything is optional and set via environment variables. Defaults are a mellow 
 | `OPENCODE_TMUX_SIGNAL_DONE_BG` / `_FG` | `colour131` / `white` | Done/error colors (soft red) |
 | `OPENCODE_TMUX_SIGNAL_WINDOW_NAME` | `llm` | `llm` (slug), `dir` (project directory), or `off` |
 | `OPENCODE_TMUX_SIGNAL_NAME_MODELS` | _(auto)_ | Optional `provider/model` override list. When unset, uses opencode's `small_model`, then a built-in fast list, then the session's model |
+| `OPENCODE_TMUX_SIGNAL_NAME_TIMEOUT_MS` | `7000` | Maximum time to spend generating a model-based window name, clamped to 1000-10000 ms |
 | `OPENCODE_TMUX_SIGNAL_RESET_ON_FOCUS` | `on` | Clear the highlight when you open the window |
 | `OPENCODE_TMUX_SIGNAL_MANAGE_TMUX_CONF` | `on` | Manage the `~/.tmux.conf` block |
 | `OPENCODE_TMUX_SIGNAL_DEBUG` | _(unset)_ | Log decisions to `/tmp/opencode-tmux-signal.log` |
