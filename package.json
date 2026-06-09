@@ -1,6 +1,6 @@
 {
   "name": "opencode-tmux-signal",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "OpenCode plugin that signals agent state in tmux — recolors the window when it needs input or finishes, and names the window after the project directory",
   "type": "module",
   "exports": {
