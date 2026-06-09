@@ -9,7 +9,6 @@ const envInt = (key: string, fallback: number, min: number, max: number): number
   const n = Number.parseInt(env(key, String(fallback)), 10)
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback
 }
-
 const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | undefined> => {
   if (ms <= 0) return undefined
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -24,8 +23,6 @@ const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T | unde
   }
 }
 
-const elapsed = (start: number): string => `${Date.now() - start}ms`
-
 const DEBUG = (process.env[PREFIX + "DEBUG"] ?? "") !== ""
 const dbg: (...a: unknown[]) => void = DEBUG
   ? (...a) => {
@@ -39,29 +36,21 @@ const dbg: (...a: unknown[]) => void = DEBUG
   : () => {}
 
 type Style = { bg: string; fg: string }
-type ModelRef = { providerID: string; modelID: string }
 
-const parseModels = (s: string): ModelRef[] =>
-  s
-    .split(",")
-    .map((x) => x.trim())
-    .filter(Boolean)
-    .map((x) => {
-      const i = x.indexOf("/")
-      return i === -1 ? null : { providerID: x.slice(0, i), modelID: x.slice(i + 1) }
-    })
-    .filter((m): m is ModelRef => m !== null)
+type CopilotAuth = {
+  type?: string
+  refresh?: string
+  access?: string
+  enterpriseUrl?: string
+}
 
 const config = {
   permission: { bg: env("PERMISSION_BG", "colour179"), fg: env("PERMISSION_FG", "black") } as Style,
   question: { bg: env("QUESTION_BG", "colour97"), fg: env("QUESTION_FG", "white") } as Style,
   done: { bg: env("DONE_BG", "colour131"), fg: env("DONE_FG", "white") } as Style,
   windowName: env("WINDOW_NAME", "llm"),
-  // Optional explicit override (comma-separated provider/model). When empty,
-  // model selection prefers opencode's small_model, then a built-in fast list,
-  // then the session's own model.
-  nameModels: parseModels(env("NAME_MODELS", "")),
-  nameTimeoutMs: envInt("NAME_TIMEOUT_MS", 7000, 1000, 10000),
+  nameModel: env("NAME_MODEL", "github-copilot/gpt-4o-mini"),
+  nameTimeoutMs: envInt("NAME_TIMEOUT_MS", 2500, 500, 10000),
   resetOnFocus: env("RESET_ON_FOCUS", "on") !== "off",
   manageTmuxConf: env("MANAGE_TMUX_CONF", "on") !== "off",
 }
@@ -69,33 +58,23 @@ const config = {
 // Maximum tmux window-name length.
 const MAX_LEN = 8
 
-// Fast, cheap models tried when no small_model is configured. A model the user
-// can't access simply errors and the next is tried; for non-listed providers,
-// the configured small_model and the session's own model cover it.
-const BUILTIN_MODELS: ModelRef[] = [
-  { providerID: "github-copilot", modelID: "claude-haiku-4.5" },
-  { providerID: "github-copilot", modelID: "gpt-4o-mini" },
-  { providerID: "github-copilot", modelID: "gpt-5-mini" },
-  { providerID: "github-copilot", modelID: "gemini-3-flash-preview" },
-]
-
-const MODEL_PROMPT_TIMEOUT_MS = 2500
-
 const DEFAULT_WINDOW_NAME = "opencode"
-const THROWAWAY_TITLE = "opencode-tmux-signal: window name"
+const COPILOT_API_VERSION = "2026-06-01"
 
-// Generic words a model might emit for a vague title — reject and try the next.
+// Generic words that aren't useful as a window name.
 const BAD_SLUGS = new Set([
   "session", "new", "untitled", "opencode", "window", "name", "task", "project", "chat", "agent", "code",
   "done", "complete", "completed", "finish", "finished", "idle",
+  "if", "ok", "okay", "please", "prompt", "title", "titles",
+  "i", "me", "my", "we", "us", "our", "you", "your", "it", "its", "this", "that", "these", "those", "they", "them", "their",
 ])
 
-// opencode's placeholder title ("New session - <ts>"), generic status titles,
-// and the throwaway title aren't meaningful — don't name a window from them.
+// opencode's placeholder title ("New session - <ts>") and generic status
+// titles aren't meaningful — don't name a window from them.
 const isRealTitle = (t?: string): boolean => {
   const s = (t || "").trim()
   const slug = slugify(s)
-  return s !== "" && s !== THROWAWAY_TITLE && !/^new session\b/i.test(s) && slug.length > 1 && !BAD_SLUGS.has(slug)
+  return s !== "" && !/^new session\b/i.test(s) && slug.length > 1 && !BAD_SLUGS.has(slug)
 }
 
 // Bare process names tmux's automatic-rename may show. If a window shows one of
@@ -156,6 +135,83 @@ const fallbackPromptSlug = (raw: string): string => {
   }
   return goodSlug(best) ? best : ""
 }
+
+const authPath = (): string => join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "opencode", "auth.json")
+
+const copilotBase = (enterpriseUrl?: string): string => {
+  if (!enterpriseUrl) return "https://api.githubcopilot.com"
+  const normalized = enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")
+  return `https://copilot-api.${normalized}`
+}
+
+const readCopilotAuth = (): CopilotAuth | undefined => {
+  try {
+    const auth = JSON.parse(readFileSync(authPath(), "utf8")) as Record<string, CopilotAuth>
+    const copilot = auth["github-copilot"]
+    if (copilot?.type === "oauth" && (copilot.refresh || copilot.access)) return copilot
+  } catch {
+    /* auth is optional; deterministic fallback covers misses */
+  }
+  return undefined
+}
+
+const directModelSlug = async (raw: string): Promise<string> => {
+  const parsed = config.nameModel.split("/")
+  const modelID = parsed[0] === "github-copilot" ? parsed.slice(1).join("/") : ""
+  if (!modelID) return ""
+  const auth = readCopilotAuth()
+  const token = auth?.refresh || auth?.access
+  if (!token) return ""
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), config.nameTimeoutMs)
+  ;(timer as any).unref?.()
+  try {
+    const response = await fetch(`${copilotBase(auth.enterpriseUrl)}/chat/completions`, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+        "openai-intent": "conversation-edits",
+        "user-agent": "opencode-tmux-signal",
+        "x-github-api-version": COPILOT_API_VERSION,
+        "x-interaction-type": "agent-session-name-generation",
+        "x-initiator": "agent",
+      },
+      body: JSON.stringify({
+        model: modelID,
+        temperature: 0,
+        max_tokens: 8,
+        messages: [
+          {
+            role: "system",
+            content:
+              `Name a tmux window for a coding session. Reply with ONLY one lowercase token, ${MAX_LEN} characters or fewer, using a-z, 0-9, or hyphen. ` +
+              "Focus on the concrete technical topic or domain. Ignore meta words like title, prompt, okay, analyze, explain. No explanation.",
+          },
+          { role: "user", content: raw.slice(0, 500) },
+        ],
+      }),
+    })
+    if (!response.ok) {
+      dbg("directModelSlug failed", response.status, modelID)
+      return ""
+    }
+    const body = (await response.json()) as any
+    const text = body?.choices?.[0]?.message?.content || body?.choices?.[0]?.text || ""
+    const slug = slugify(text)
+    dbg("directModelSlug", modelID, "->", JSON.stringify(slug))
+    return goodSlug(slug) && !STOPWORDS.has(slug) ? slug : ""
+  } catch (e) {
+    dbg("directModelSlug error", String(e).slice(0, 120))
+    return ""
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const nameSlug = async (raw: string): Promise<string> => fastStructuredSlug(raw) || (await directModelSlug(raw)) || fallbackPromptSlug(raw)
 
 // Project directory as a window name. `dirFull` is the untruncated lowercased
 // basename (used to recognize a window we previously named after the dir, even
@@ -266,10 +322,9 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     }
     return ok
   }
-  const timeLeft = (deadline: number): number => Math.max(0, deadline - Date.now())
-  const waitForInit = async (deadline: number): Promise<boolean> => {
+  const waitForInit = async (ms = 1000): Promise<boolean> => {
     if (initDone) return initOk
-    return (await withTimeout(initReady, timeLeft(deadline))) === true
+    return (await withTimeout(initReady, ms)) === true
   }
 
   const applyStyle = (s: Style) =>
@@ -280,9 +335,9 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   const childSessions = new Set<string>()
 
   let ourName: string | null = null
-  const renameIfOurs = async (name: string, deadline = Date.now() + config.nameTimeoutMs): Promise<void> => {
+  const renameIfOurs = async (name: string): Promise<void> => {
     if (!name) return
-    if (!(await waitForInit(deadline))) return
+    if (!(await waitForInit())) return
     const cur = await tmuxOut("display-message", "-p", "-t", windowId, "#{window_name}")
     const d = worktree || directory
     const ours =
@@ -305,98 +360,6 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     dbg("renamed window ->", name)
   }
 
-  const dedupeAdd = (arr: ModelRef[], m?: ModelRef | null): void => {
-    if (m?.providerID && m?.modelID && !arr.some((x) => x.providerID === m.providerID && x.modelID === m.modelID)) arr.push(m)
-  }
-  const parseModel = (s?: string): ModelRef | null => {
-    const i = (s || "").indexOf("/")
-    return i > 0 ? { providerID: (s as string).slice(0, i), modelID: (s as string).slice(i + 1) } : null
-  }
-  // Resolve naming models, preferring a subscription-appropriate small model:
-  // explicit override -> opencode's configured small_model -> built-in fast list
-  // -> the session's own model (always usable with the active subscription).
-  const resolveModels = async (sessionModel?: ModelRef, deadline = Date.now() + config.nameTimeoutMs): Promise<ModelRef[]> => {
-    const start = Date.now()
-    const out: ModelRef[] = []
-    if (config.nameModels.length) {
-      config.nameModels.forEach((m) => dedupeAdd(out, m))
-    } else {
-      try {
-        const left = timeLeft(deadline)
-        const c = left > 0 ? await withTimeout(client.config.get(), left) : undefined
-        if (!c) dbg("resolveModels config timeout", elapsed(start))
-        dedupeAdd(out, parseModel((c?.data as any)?.small_model))
-      } catch {
-        /* ignore */
-      }
-      BUILTIN_MODELS.forEach((m) => dedupeAdd(out, m))
-    }
-    dedupeAdd(out, sessionModel)
-    dbg("resolveModels", out.map((m) => `${m.providerID}/${m.modelID}`).join(","), elapsed(start))
-    return out
-  }
-
-  const textParts = (res: any): string =>
-    ((res?.data?.parts ?? []) as any[]).filter((p) => p.type === "text").map((p) => p.text as string).join(" ")
-
-  // Ask a model for a window-name slug. The model is told to keep it <= MAX_LEN;
-  // if it returns something longer we reject it and ask again (trying the next
-  // model / a stronger instruction) rather than blindly truncating.
-  const llmSlug = async (text: string, sessionModel?: ModelRef, deadline = Date.now() + config.nameTimeoutMs): Promise<string> => {
-    const start = Date.now()
-    const models = await resolveModels(sessionModel, deadline)
-    if (!models.length) return ""
-    try {
-      const base =
-        "You name a tmux window for a coding session. Reply with ONLY one lowercase token " +
-        `(a word, abbreviation, or acronym), ${MAX_LEN} characters or fewer, using only a-z, 0-9 and hyphens. ` +
-        "No spaces, quotes, punctuation, or explanation."
-      const userText = `Task: ${text.slice(0, 400)}`
-      let best = ""
-      for (let i = 0; i < models.length; i++) {
-        let tmpId = ""
-        const model = models[i]
-        const system =
-          i === 0 ? base : `${base} Your previous answer was too long — it MUST be ${MAX_LEN} characters or fewer; abbreviate or use an acronym.`
-        try {
-          if (timeLeft(deadline) <= 0) break
-          const created = await withTimeout(client.session.create({ body: { title: THROWAWAY_TITLE } }), Math.min(500, timeLeft(deadline)))
-          if (!created?.data?.id) {
-            dbg("llmSlug create timeout", `${model.providerID}/${model.modelID}`, elapsed(start))
-            continue
-          }
-          tmpId = created.data.id
-          childSessions.add(tmpId)
-          const attemptMs = Math.min(MODEL_PROMPT_TIMEOUT_MS, timeLeft(deadline))
-          const res = await withTimeout(client.session.prompt({
-            path: { id: tmpId },
-            body: { model, system, parts: [{ type: "text" as const, text: userText }] },
-          }), attemptMs)
-          if (!res) {
-            dbg("llmSlug prompt timeout", `${model.providerID}/${model.modelID}`, elapsed(start))
-            continue
-          }
-          const slug = slugify(textParts(res))
-          dbg("llmSlug", `${model.providerID}/${model.modelID}`, "->", JSON.stringify(slug), `(len ${slug.length})`)
-          if (slug && !BAD_SLUGS.has(slug)) {
-            if (goodSlug(slug)) return slug
-            if (!best) best = slug // remember in case nothing fits, as a last resort
-          }
-        } catch (e) {
-          dbg("llmSlug model failed", `${model.providerID}/${model.modelID}`, String(e).slice(0, 120))
-        } finally {
-          if (tmpId) void client.session.delete({ path: { id: tmpId } }).catch(() => {})
-        }
-      }
-      const fallback = best.slice(0, MAX_LEN)
-      if (!fallback) dbg("llmSlug no usable slug", elapsed(start))
-      return fallback.length > 1 && !BAD_SLUGS.has(fallback) ? fallback : ""
-    } catch (e) {
-      dbg("llmSlug error", String(e).slice(0, 160))
-      return ""
-    }
-  }
-
   // Name the window for `sessionID`, in priority order:
   //   1. real session title (a resumed/named session)
   //   2. the first prompt (a brand-new session)
@@ -406,54 +369,36 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
   let contentSession: string | null = null // named from title/prompt (final)
   let dirSession: string | null = null // named from the directory (upgradable)
   const namingSessions = new Set<string>()
-  const nameSession = async (sessionID?: string, promptText?: string, fallbackModel?: ModelRef): Promise<void> => {
+  const nameSession = async (sessionID?: string, promptText?: string): Promise<void> => {
     if (!llmMode || !sessionID) return
     if (childSessions.has(sessionID) || sessionID === contentSession || namingSessions.has(sessionID)) return
     namingSessions.add(sessionID)
-    const deadline = Date.now() + config.nameTimeoutMs
     try {
-      if (!(await waitForInit(deadline))) return
+      if (!(await waitForInit())) return
       let title = ""
       let createdAt = 0
       try {
-        const left = timeLeft(deadline)
-        const s = left > 0 ? await withTimeout(client.session.get({ path: { id: sessionID } }), left) : undefined
+        const s = await withTimeout(client.session.get({ path: { id: sessionID } }), 1000)
         title = (s?.data?.title || "").trim()
         createdAt = s?.data?.time?.created || 0
       } catch {
         /* ignore */
       }
-      if (title === THROWAWAY_TITLE) {
-        childSessions.add(sessionID)
-        return
-      }
       const resumed = createdAt > 0 && createdAt < startTime - 30000
       if (resumed && isRealTitle(title)) {
-        contentSession = sessionID // claim before the async model call
-        const quick = fastStructuredSlug(title)
-        if (quick) {
-          dbg("nameSession fast-title", sessionID, "->", JSON.stringify(quick))
-          await renameIfOurs(quick, deadline)
-          return
-        }
-        const slug = (await llmSlug(title, fallbackModel, deadline)) || fallbackPromptSlug(title)
+        contentSession = sessionID
+        const slug = await nameSlug(title)
         dbg("nameSession title", sessionID, "->", JSON.stringify(slug))
-        if (slug) await renameIfOurs(slug, deadline)
+        if (slug) await renameIfOurs(slug)
         else contentSession = null
         return
       }
       const content = (promptText || "").trim()
       if (content && !BAD_SLUGS.has(slugify(content))) {
-        contentSession = sessionID // claim before the async model call
-        const quick = fastStructuredSlug(content)
-        if (quick) {
-          dbg("nameSession fast-prompt", sessionID, "->", JSON.stringify(quick))
-          await renameIfOurs(quick, deadline)
-          return
-        }
-        const slug = (await llmSlug(content, fallbackModel, deadline)) || fallbackPromptSlug(content)
+        contentSession = sessionID
+        const slug = await nameSlug(content)
         dbg("nameSession prompt", sessionID, "->", JSON.stringify(slug))
-        if (slug) await renameIfOurs(slug, deadline)
+        if (slug) await renameIfOurs(slug)
         else contentSession = null
         return
       }
@@ -464,7 +409,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
         dirSession = sessionID
         const dn = dirName(worktree || directory)
         dbg("nameSession dir-fallback", sessionID, "->", JSON.stringify(dn))
-        if (dn) await renameIfOurs(dn, deadline)
+        if (dn) await renameIfOurs(dn)
       }
     } catch (e) {
       dbg("nameSession error", String(e).slice(0, 160))
@@ -538,8 +483,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
     (await tmuxOut("display-message", "-p", "-t", windowId, "#{window_active}")) === "1"
 
   const setState = async (state: State): Promise<void> => {
-    const deadline = Date.now() + 1000
-    if (!(await waitForInit(deadline))) return
+    if (!(await waitForInit(1000))) return
     if (state !== lastState) dbg("state", lastState, "->", state)
     lastState = state
     const style =
@@ -601,7 +545,7 @@ export const TmuxSignal: Plugin = async ({ $, client, directory, worktree }) => 
         .filter((p) => p.type === "text")
         .map((p) => p.text as string)
         .join(" ")
-      void nameSession(input.sessionID, text, input.model)
+      void nameSession(input.sessionID, text)
     },
 
     "permission.ask": async () => {
